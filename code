@@ -1,0 +1,1110 @@
+#include <iostream>
+#include <vector>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <queue>
+#include <algorithm>
+#include <limits>
+#include <cmath>
+#include <memory>
+#include <fstream>
+#include <sstream>
+#include <iomanip>
+#include <chrono>
+#include <curl/curl.h>
+#include <nlohmann/json.hpp>
+
+using namespace std;
+
+// Configuration and constants
+namespace Config {
+    const double INFINITY_DISTANCE = numeric_limits<double>::max();
+    const int MAX_LOCATIONS = 1000;
+    const double EARTH_RADIUS_KM = 6371.0;
+    
+    // Google Maps API Configuration
+    const string GOOGLE_MAPS_API_KEY = "AIzaSyBcKhLLpHTzEL2_xMJkT2XB4zr-ZLbcxs0"; // Replace with your actual API key
+    const string GOOGLE_GEOCODING_URL = "https://maps.googleapis.com/maps/api/geocode/json";
+    const string GOOGLE_DIRECTIONS_URL = "https://maps.googleapis.com/maps/api/directions/json";
+    const string GOOGLE_PLACES_URL = "https://maps.googleapis.com/maps/api/place/textsearch/json";
+    const string GOOGLE_DISTANCE_MATRIX_URL = "https://maps.googleapis.com/maps/api/distancematrix/json";
+}
+
+// JSON library alias
+using json = nlohmann::json;
+
+// HTTP response callback for libcurl
+size_t WriteCallback(void* contents, size_t size, size_t nmemb, string* userp) {
+    userp->append((char*)contents, size * nmemb);
+    return size * nmemb;
+}
+
+// Google Maps API client class
+class GoogleMapsAPI {
+private:
+    CURL* curl;
+    
+    string makeHTTPRequest(const string& url) {
+        string response;
+        
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+        
+        CURLcode res = curl_easy_perform(curl);
+        if (res != CURLE_OK) {
+            throw runtime_error("HTTP request failed: " + string(curl_easy_strerror(res)));
+        }
+        
+        return response;
+    }
+    
+    string urlEncode(const string& str) {
+        char* encoded = curl_easy_escape(curl, str.c_str(), str.length());
+        string result(encoded);
+        curl_free(encoded);
+        return result;
+    }
+    
+public:
+    GoogleMapsAPI() {
+        curl_global_init(CURL_GLOBAL_DEFAULT);
+        curl = curl_easy_init();
+        if (!curl) {
+            throw runtime_error("Failed to initialize CURL");
+        }
+    }
+    
+    ~GoogleMapsAPI() {
+        if (curl) {
+            curl_easy_cleanup(curl);
+        }
+        curl_global_cleanup();
+    }
+    
+    // Geocoding: Convert address to coordinates
+    struct GeocodingResult {
+        double latitude;
+        double longitude;
+        string formatted_address;
+        bool success;
+        
+        GeocodingResult() : latitude(0.0), longitude(0.0), success(false) {}
+    };
+    
+    GeocodingResult geocodeAddress(const string& address) {
+        GeocodingResult result;
+        
+        string url = Config::GOOGLE_GEOCODING_URL + "?address=" + urlEncode(address) + 
+                         "&key=" + Config::GOOGLE_MAPS_API_KEY;
+        
+        try {
+            string response = makeHTTPRequest(url);
+            json j = json::parse(response);
+            
+            if (j["status"] == "OK" && !j["results"].empty()) {
+                auto& location = j["results"][0]["geometry"]["location"];
+                result.latitude = location["lat"];
+                result.longitude = location["lng"];
+                result.formatted_address = j["results"][0]["formatted_address"];
+                result.success = true;
+            }
+        } catch (const exception& e) {
+            cerr << "Geocoding error: " << e.what() << endl;
+        }
+        
+        return result;
+    }
+    
+    // Reverse geocoding: Convert coordinates to address
+    GeocodingResult reverseGeocode(double latitude, double longitude) {
+        GeocodingResult result;
+        
+        string url = Config::GOOGLE_GEOCODING_URL + "?latlng=" + 
+                         to_string(latitude) + "," + to_string(longitude) + 
+                         "&key=" + Config::GOOGLE_MAPS_API_KEY;
+        
+        try {
+            string response = makeHTTPRequest(url);
+            json j = json::parse(response);
+            
+            if (j["status"] == "OK" && !j["results"].empty()) {
+                result.latitude = latitude;
+                result.longitude = longitude;
+                result.formatted_address = j["results"][0]["formatted_address"];
+                result.success = true;
+            }
+        } catch (const exception& e) {
+            cerr << "Reverse geocoding error: " << e.what() << endl;
+        }
+        
+        return result;
+    }
+    
+    // Get directions between two points
+    struct DirectionsResult {
+        vector<string> waypoints;
+        double totalDistance; // in meters
+        double totalDuration; // in seconds
+        string polyline;
+        bool success;
+        
+        DirectionsResult() : totalDistance(0.0), totalDuration(0.0), success(false) {}
+    };
+    
+    DirectionsResult getDirections(const string& origin, const string& destination, 
+                                 const string& mode = "driving") {
+        DirectionsResult result;
+        
+        string url = Config::GOOGLE_DIRECTIONS_URL + "?origin=" + urlEncode(origin) + 
+                         "&destination=" + urlEncode(destination) + 
+                         "&mode=" + mode + 
+                         "&key=" + Config::GOOGLE_MAPS_API_KEY;
+        
+        try {
+            string response = makeHTTPRequest(url);
+            json j = json::parse(response);
+            
+            if (j["status"] == "OK" && !j["routes"].empty()) {
+                auto& route = j["routes"][0];
+                auto& leg = route["legs"][0];
+                
+                result.totalDistance = leg["distance"]["value"];
+                result.totalDuration = leg["duration"]["value"];
+                result.polyline = route["overview_polyline"]["points"];
+                
+                // Extract waypoints
+                for (auto& step : leg["steps"]) {
+                    result.waypoints.push_back(step["html_instructions"]);
+                }
+                
+                result.success = true;
+            }
+        } catch (const exception& e) {
+            cerr << "Directions error: " << e.what() << endl;
+        }
+        
+        return result;
+    }
+    
+    // Search for places
+    struct Place {
+        string place_id;
+        string name;
+        string address;
+        double latitude;
+        double longitude;
+        double rating;
+        
+        Place() : latitude(0.0), longitude(0.0), rating(0.0) {}
+    };
+    
+    vector<Place> searchPlaces(const string& query, double latitude = 0.0, double longitude = 0.0) {
+        vector<Place> places;
+        
+        string url = Config::GOOGLE_PLACES_URL + "?query=" + urlEncode(query) + 
+                         "&key=" + Config::GOOGLE_MAPS_API_KEY;
+        
+        if (latitude != 0.0 && longitude != 0.0) {
+            url += "&location=" + to_string(latitude) + "," + to_string(longitude);
+            url += "&radius=50000"; // 50km radius
+        }
+        
+        try {
+            string response = makeHTTPRequest(url);
+            json j = json::parse(response);
+            
+            if (j["status"] == "OK") {
+                for (auto& place : j["results"]) {
+                    Place p;
+                    p.place_id = place["place_id"];
+                    p.name = place["name"];
+                    p.address = place["formatted_address"];
+                    p.latitude = place["geometry"]["location"]["lat"];
+                    p.longitude = place["geometry"]["location"]["lng"];
+                    if (place.contains("rating")) {
+                        p.rating = place["rating"];
+                    }
+                    places.push_back(p);
+                }
+            }
+        } catch (const exception& e) {
+            cerr << "Places search error: " << e.what() << endl;
+        }
+        
+        return places;
+    }
+    
+    // Get distance matrix between multiple origins and destinations
+    struct DistanceMatrixResult {
+        vector<vector<double>> distances; // in meters
+        vector<vector<double>> durations; // in seconds
+        bool success;
+        
+        DistanceMatrixResult() : success(false) {}
+    };
+    
+    DistanceMatrixResult getDistanceMatrix(const vector<string>& origins, 
+                                         const vector<string>& destinations) {
+        DistanceMatrixResult result;
+        
+        string origins_str, destinations_str;
+        for (size_t i = 0; i < origins.size(); ++i) {
+            if (i > 0) origins_str += "|";
+            origins_str += urlEncode(origins[i]);
+        }
+        for (size_t i = 0; i < destinations.size(); ++i) {
+            if (i > 0) destinations_str += "|";
+            destinations_str += urlEncode(destinations[i]);
+        }
+        
+        string url = Config::GOOGLE_DISTANCE_MATRIX_URL + "?origins=" + origins_str + 
+                         "&destinations=" + destinations_str + 
+                         "&key=" + Config::GOOGLE_MAPS_API_KEY;
+        
+        try {
+            string response = makeHTTPRequest(url);
+            json responseJson = json::parse(response);
+            
+            if (responseJson["status"] == "OK") {
+                result.distances.resize(origins.size());
+                result.durations.resize(origins.size());
+                
+                for (size_t i = 0; i < origins.size(); ++i) {
+                    result.distances[i].resize(destinations.size());
+                    result.durations[i].resize(destinations.size());
+                    
+                    for (size_t j = 0; j < destinations.size(); ++j) {
+                        if (responseJson["rows"][i]["elements"][j]["status"] == "OK") {
+                            result.distances[i][j] = responseJson["rows"][i]["elements"][j]["distance"]["value"];
+                            result.durations[i][j] = responseJson["rows"][i]["elements"][j]["duration"]["value"];
+                        } else {
+                            result.distances[i][j] = Config::INFINITY_DISTANCE * 1000; // Convert to meters
+                            result.durations[i][j] = numeric_limits<double>::max();
+                        }
+                    }
+                }
+                result.success = true;
+            }
+        } catch (const exception& e) {
+            cerr << "Distance matrix error: " << e.what() << endl;
+        }
+        
+        return result;
+    }
+};
+
+// Location class representing a point on the map
+class Location {
+public:
+    string id;
+    string name;
+    double latitude;
+    double longitude;
+    
+    Location(const string& id, const string& name, double lat, double lon)
+        : id(id), name(name), latitude(lat), longitude(lon) {}
+    
+    // Calculate haversine distance between two locations
+    double distanceTo(const Location& other) const {
+        double lat1Rad = latitude * M_PI / 180.0;
+        double lon1Rad = longitude * M_PI / 180.0;
+        double lat2Rad = other.latitude * M_PI / 180.0;
+        double lon2Rad = other.longitude * M_PI / 180.0;
+        
+        double dlat = lat2Rad - lat1Rad;
+        double dlon = lon2Rad - lon1Rad;
+        
+        double a = sin(dlat/2) * sin(dlat/2) +
+                   cos(lat1Rad) * cos(lat2Rad) *
+                   sin(dlon/2) * sin(dlon/2);
+        
+        double c = 2 * atan2(sqrt(a), sqrt(1-a));
+        return Config::EARTH_RADIUS_KM * c;
+    }
+    
+    string toString() const {
+        return name + " (" + id + ") [" + to_string(latitude) + ", " + to_string(longitude) + "]";
+    }
+};
+
+// Edge class representing a connection between two locations
+class Edge {
+public:
+    string fromId;
+    string toId;
+    double weight;
+    string roadType;
+    
+    Edge(const string& from, const string& to, double w, const string& type = "road")
+        : fromId(from), toId(to), weight(w), roadType(type) {}
+};
+
+// Graph class for managing locations and connections
+class Graph {
+private:
+    unordered_map<string, unique_ptr<Location>> locations;
+    unordered_map<string, vector<Edge>> adjacencyList;
+    
+public:
+    void addLocation(const string& id, const string& name, double lat, double lon) {
+        locations[id] = make_unique<Location>(id, name, lat, lon);
+        if (adjacencyList.find(id) == adjacencyList.end()) {
+            adjacencyList[id] = vector<Edge>();
+        }
+    }
+    
+    void addEdge(const string& from, const string& to, double weight, const string& roadType = "road") {
+        if (locations.find(from) == locations.end() || locations.find(to) == locations.end()) {
+            throw runtime_error("Location not found when adding edge");
+        }
+        
+        adjacencyList[from].emplace_back(from, to, weight, roadType);
+        // For undirected graph, add reverse edge
+        adjacencyList[to].emplace_back(to, from, weight, roadType);
+    }
+    
+    const Location* getLocation(const string& id) const {
+        auto it = locations.find(id);
+        return (it != locations.end()) ? it->second.get() : nullptr;
+    }
+    
+    const vector<Edge>& getEdges(const string& locationId) const {
+        static const vector<Edge> empty;
+        auto it = adjacencyList.find(locationId);
+        return (it != adjacencyList.end()) ? it->second : empty;
+    }
+    
+    vector<string> getAllLocationIds() const {
+        vector<string> ids;
+        for (const auto& pair : locations) {
+            ids.push_back(pair.first);
+        }
+        return ids;
+    }
+    
+    size_t size() const {
+        return locations.size();
+    }
+    
+    void printGraph() const {
+        cout << "\n=== GRAPH STRUCTURE ===\n";
+        for (const auto& pair : locations) {
+            cout << pair.second->toString() << "\n";
+            for (const auto& edge : adjacencyList.at(pair.first)) {
+                cout << "  -> " << edge.toId << " (distance: " 
+                     << fixed << setprecision(2) << edge.weight << " km)\n";
+            }
+        }
+    }
+};
+
+// Route result class
+class RouteResult {
+public:
+    std::vector<std::string> path;
+    double totalDistance;
+    double totalTime; // in hours, assuming average speed
+    bool found;
+    
+    RouteResult() : totalDistance(0.0), totalTime(0.0), found(false) {}
+    
+    void calculateTime(double avgSpeedKmh = 50.0) {
+        totalTime = totalDistance / avgSpeedKmh;
+    }
+    
+    std::string toString(const Graph& graph) const {
+        if (!found) {
+            return "No route found";
+        }
+        
+        std::stringstream ss;
+        ss << "Route: ";
+        for (size_t i = 0; i < path.size(); ++i) {
+            const Location* loc = graph.getLocation(path[i]);
+            if (loc) {
+                ss << loc->name;
+                if (i < path.size() - 1) ss << " -> ";
+            }
+        }
+        ss << "\nTotal Distance: " << std::fixed << std::setprecision(2) << totalDistance << " km";
+        ss << "\nEstimated Time: " << std::fixed << std::setprecision(1) << totalTime << " hours";
+        return ss.str();
+    }
+};
+
+// Dijkstra's algorithm implementation
+class DijkstraRouter {
+private:
+    struct Node {
+        string id;
+        double distance;
+        string previous;
+        
+        Node(const string& id, double dist) : id(id), distance(dist) {}
+        
+        bool operator>(const Node& other) const {
+            return distance > other.distance;
+        }
+    };
+    
+public:
+    static RouteResult findShortestPath(const Graph& graph, const string& start, const string& end) {
+        RouteResult result;
+        
+        if (graph.getLocation(start) == nullptr || graph.getLocation(end) == nullptr) {
+            return result;
+        }
+        
+        unordered_map<string, double> distances;
+        unordered_map<string, string> previous;
+        unordered_set<string> visited;
+        priority_queue<Node, vector<Node>, greater<Node>> pq;
+        
+        // Initialize distances
+        for (const auto& id : graph.getAllLocationIds()) {
+            distances[id] = Config::INFINITY_DISTANCE;
+        }
+        distances[start] = 0.0;
+        
+        pq.emplace(start, 0.0);
+        
+        while (!pq.empty()) {
+            Node current = pq.top();
+            pq.pop();
+            
+            if (visited.find(current.id) != visited.end()) {
+                continue;
+            }
+            
+            visited.insert(current.id);
+            
+            if (current.id == end) {
+                break;
+            }
+            
+            for (const auto& edge : graph.getEdges(current.id)) {
+                if (visited.find(edge.toId) == visited.end()) {
+                    double newDist = distances[current.id] + edge.weight;
+                    if (newDist < distances[edge.toId]) {
+                        distances[edge.toId] = newDist;
+                        previous[edge.toId] = current.id;
+                        pq.emplace(edge.toId, newDist);
+                    }
+                }
+            }
+        }
+        
+        // Reconstruct path
+        if (distances[end] != Config::INFINITY_DISTANCE) {
+            string current = end;
+            vector<string> path;
+            
+            while (!current.empty()) {
+                path.push_back(current);
+                auto it = previous.find(current);
+                current = (it != previous.end()) ? it->second : "";
+            }
+            
+            reverse(path.begin(), path.end());
+            result.path = path;
+            result.totalDistance = distances[end];
+            result.found = true;
+            result.calculateTime();
+        }
+        
+        return result;
+    }
+};
+
+// A* algorithm implementation with heuristic
+class AStarRouter {
+private:
+    struct Node {
+        string id;
+        double gScore;  // actual distance from start
+        double fScore;  // gScore + heuristic
+        string previous;
+        
+        Node(const string& id, double g, double f) : id(id), gScore(g), fScore(f) {}
+        
+        bool operator>(const Node& other) const {
+            return fScore > other.fScore;
+        }
+    };
+    
+    static double heuristic(const Location* from, const Location* to) {
+        return from->distanceTo(*to);
+    }
+    
+public:
+    static RouteResult findShortestPath(const Graph& graph, const string& start, const string& end) {
+        RouteResult result;
+        
+        const Location* startLoc = graph.getLocation(start);
+        const Location* endLoc = graph.getLocation(end);
+        
+        if (startLoc == nullptr || endLoc == nullptr) {
+            return result;
+        }
+        
+        unordered_map<string, double> gScore;
+        unordered_map<string, string> previous;
+        unordered_set<string> closedSet;
+        priority_queue<Node, vector<Node>, greater<Node>> openSet;
+        
+        // Initialize
+        for (const auto& id : graph.getAllLocationIds()) {
+            gScore[id] = Config::INFINITY_DISTANCE;
+        }
+        gScore[start] = 0.0;
+        
+        double hStart = heuristic(startLoc, endLoc);
+        openSet.emplace(start, 0.0, hStart);
+        
+        while (!openSet.empty()) {
+            Node current = openSet.top();
+            openSet.pop();
+            
+            if (closedSet.find(current.id) != closedSet.end()) {
+                continue;
+            }
+            
+            closedSet.insert(current.id);
+            
+            if (current.id == end) {
+                break;
+            }
+            
+            for (const auto& edge : graph.getEdges(current.id)) {
+                if (closedSet.find(edge.toId) == closedSet.end()) {
+                    double tentativeG = gScore[current.id] + edge.weight;
+                    
+                    if (tentativeG < gScore[edge.toId]) {
+                        gScore[edge.toId] = tentativeG;
+                        previous[edge.toId] = current.id;
+                        
+                        const Location* neighborLoc = graph.getLocation(edge.toId);
+                        double h = heuristic(neighborLoc, endLoc);
+                        double f = tentativeG + h;
+                        
+                        openSet.emplace(edge.toId, tentativeG, f);
+                    }
+                }
+            }
+        }
+        
+        // Reconstruct path
+        if (gScore[end] != Config::INFINITY_DISTANCE) {
+            string current = end;
+            vector<string> path;
+            
+            while (!current.empty()) {
+                path.push_back(current);
+                auto it = previous.find(current);
+                current = (it != previous.end()) ? it->second : "";
+            }
+            
+            reverse(path.begin(), path.end());
+            result.path = path;
+            result.totalDistance = gScore[end];
+            result.found = true;
+            result.calculateTime();
+        }
+        
+        return result;
+    }
+};
+
+// Multi-destination route optimizer using TSP approach
+class MultiDestinationRouter {
+public:
+    struct MultiRouteResult {
+        vector<string> optimalOrder;
+        double totalDistance;
+        double totalTime;
+        bool found;
+        
+        MultiRouteResult() : totalDistance(0.0), totalTime(0.0), found(false) {}
+    };
+    
+    // Solve TSP using nearest neighbor heuristic (for production, consider more sophisticated algorithms)
+    static MultiRouteResult optimizeRoute(const Graph& graph, const string& start, 
+                                        const vector<string>& destinations) {
+        MultiRouteResult result;
+        
+        if (destinations.empty()) {
+            result.optimalOrder = {start};
+            result.found = true;
+            return result;
+        }
+        
+        // Create distance matrix
+        vector<string> allPoints = {start};
+        allPoints.insert(allPoints.end(), destinations.begin(), destinations.end());
+        
+        unordered_map<string, unordered_map<string, double>> distanceMatrix;
+        
+        // Calculate all pairwise distances
+        for (const auto& from : allPoints) {
+            for (const auto& to : allPoints) {
+                if (from != to) {
+                    auto route = DijkstraRouter::findShortestPath(graph, from, to);
+                    distanceMatrix[from][to] = route.found ? route.totalDistance : Config::INFINITY_DISTANCE;
+                }
+            }
+        }
+        
+        // Nearest neighbor TSP heuristic
+        vector<string> route = {start};
+        unordered_set<string> visited = {start};
+        string current = start;
+        double totalDist = 0.0;
+        
+        while (visited.size() < allPoints.size()) {
+            string nearest;
+            double minDist = Config::INFINITY_DISTANCE;
+            
+            for (const auto& dest : allPoints) {
+                if (visited.find(dest) == visited.end()) {
+                    double dist = distanceMatrix[current][dest];
+                    if (dist < minDist) {
+                        minDist = dist;
+                        nearest = dest;
+                    }
+                }
+            }
+            
+            if (!nearest.empty() && minDist != Config::INFINITY_DISTANCE) {
+                route.push_back(nearest);
+                visited.insert(nearest);
+                totalDist += minDist;
+                current = nearest;
+            } else {
+                break;
+            }
+        }
+        
+        if (route.size() == allPoints.size()) {
+            result.optimalOrder = route;
+            result.totalDistance = totalDist;
+            result.totalTime = totalDist / 50.0; // Assuming 50 km/h average speed
+            result.found = true;
+        }
+        
+        return result;
+    }
+};
+
+// Main application class
+class RouteOptimizer {
+private:
+    Graph graph;
+    unique_ptr<GoogleMapsAPI> mapsAPI;
+    
+    void initializeSampleData() {
+        // Sample locations in a city (simulated coordinates)
+        graph.addLocation("A", "Downtown", 40.7128, -74.0060);
+        graph.addLocation("B", "Central Park", 40.7812, -73.9665);
+        graph.addLocation("C", "Airport", 40.6413, -73.7781);
+        graph.addLocation("D", "University", 40.8176, -73.9482);
+        graph.addLocation("E", "Mall", 40.7505, -73.9934);
+        graph.addLocation("F", "Hospital", 40.7369, -74.0107);
+        graph.addLocation("G", "Stadium", 40.8296, -73.9262);
+        graph.addLocation("H", "Beach", 40.5795, -73.9707);
+        
+        // Add connections with realistic distances
+        graph.addEdge("A", "B", 8.5, "avenue");
+        graph.addEdge("A", "E", 3.2, "street");
+        graph.addEdge("A", "F", 2.1, "street");
+        graph.addEdge("B", "D", 4.8, "avenue");
+        graph.addEdge("B", "E", 5.5, "street");
+        graph.addEdge("C", "H", 12.3, "highway");
+        graph.addEdge("C", "A", 25.8, "highway");
+        graph.addEdge("D", "G", 3.4, "street");
+        graph.addEdge("D", "E", 7.1, "avenue");
+        graph.addEdge("E", "F", 4.2, "street");
+        graph.addEdge("F", "H", 18.7, "highway");
+        graph.addEdge("G", "B", 6.9, "avenue");
+        graph.addEdge("H", "A", 22.4, "highway");
+        graph.addEdge("G", "C", 15.2, "highway");
+    }
+    
+public:
+    RouteOptimizer() {
+        initializeSampleData();
+        try {
+            mapsAPI = make_unique<GoogleMapsAPI>();
+        } catch (const exception& e) {
+            cerr << "Warning: Google Maps API not available: " << e.what() << endl;
+            cerr << "Using offline mode with sample data only." << endl;
+        }
+    }
+    
+    void printAvailableLocations() const {
+        cout << "\n=== AVAILABLE LOCATIONS ===\n";
+        for (const auto& id : graph.getAllLocationIds()) {
+            const Location* loc = graph.getLocation(id);
+            if (loc) {
+                cout << id << ": " << loc->name << "\n";
+            }
+        }
+    }
+    
+    void findRoute(const string& start, const string& end, const string& algorithm = "dijkstra") {
+        cout << "\n=== ROUTE PLANNING ===\n";
+        cout << "From: " << (graph.getLocation(start) ? graph.getLocation(start)->name : "Unknown") << "\n";
+        cout << "To: " << (graph.getLocation(end) ? graph.getLocation(end)->name : "Unknown") << "\n";
+        cout << "Algorithm: " << algorithm << "\n\n";
+        
+        auto startTime = chrono::high_resolution_clock::now();
+        
+        RouteResult result;
+        if (algorithm == "astar") {
+            result = AStarRouter::findShortestPath(graph, start, end);
+        } else {
+            result = DijkstraRouter::findShortestPath(graph, start, end);
+        }
+        
+        auto endTime = chrono::high_resolution_clock::now();
+        auto duration = chrono::duration_cast<chrono::microseconds>(endTime - startTime);
+        
+        cout << result.toString(graph) << "\n";
+        cout << "Computation time: " << duration.count() << " microseconds\n";
+    }
+    
+    void optimizeMultiDestination(const string& start, const vector<string>& destinations) {
+        cout << "\n=== MULTI-DESTINATION OPTIMIZATION ===\n";
+        cout << "Starting from: " << (graph.getLocation(start) ? graph.getLocation(start)->name : "Unknown") << "\n";
+        cout << "Destinations: ";
+        for (const auto& dest : destinations) {
+            const Location* loc = graph.getLocation(dest);
+            if (loc) cout << loc->name << " ";
+        }
+        cout << "\n\n";
+        
+        auto startTime = chrono::high_resolution_clock::now();
+        auto result = MultiDestinationRouter::optimizeRoute(graph, start, destinations);
+        auto endTime = chrono::high_resolution_clock::now();
+        auto duration = chrono::duration_cast<chrono::microseconds>(endTime - startTime);
+        
+        if (result.found) {
+            cout << "Optimal Route Order:\n";
+            for (size_t i = 0; i < result.optimalOrder.size(); ++i) {
+                const Location* loc = graph.getLocation(result.optimalOrder[i]);
+                if (loc) {
+                    cout << (i + 1) << ". " << loc->name;
+                    if (i < result.optimalOrder.size() - 1) cout << " ->";
+                    cout << "\n";
+                }
+            }
+            cout << "\nTotal Distance: " << fixed << setprecision(2) << result.totalDistance << " km\n";
+            cout << "Estimated Time: " << fixed << setprecision(1) << result.totalTime << " hours\n";
+        } else {
+            cout << "Could not find optimal route\n";
+        }
+        
+        cout << "Computation time: " << duration.count() << " microseconds\n";
+    }
+    
+    // Google Maps API integration methods
+    void geocodeAddress(const std::string& address) {
+        if (!mapsAPI) {
+        std::cout << "Google Maps API not available\n";
+            return;
+        }
+        
+        std::cout << "\n=== GEOCODING ===\n";
+        std::cout << "Address: " << address << "\n";
+        
+        auto result = mapsAPI->geocodeAddress(address);
+        if (result.success) {
+            std::cout << "Coordinates: " << result.latitude << ", " << result.longitude << "\n";
+            std::cout << "Formatted Address: " << result.formatted_address << "\n";
+            
+            // Add to graph if not exists
+            std::string id = "GEO_" + std::to_string(static_cast<int>(result.latitude * 1000)) + 
+                           "_" + std::to_string(static_cast<int>(result.longitude * 1000));
+            graph.addLocation(id, result.formatted_address, result.latitude, result.longitude);
+            std::cout << "Added to graph with ID: " << id << "\n";
+        } else {
+            std::cout << "Geocoding failed\n";
+        }
+    }
+    
+    void getRealTimeDirections(const std::string& origin, const std::string& destination, 
+                             const std::string& mode = "driving") {
+        if (!mapsAPI) {
+            std::cout << "Google Maps API not available\n";
+            return;
+        }
+        
+        std::cout << "\n=== REAL-TIME DIRECTIONS ===\n";
+        std::cout << "From: " << origin << "\n";
+        std::cout << "To: " << destination << "\n";
+        std::cout << "Mode: " << mode << "\n\n";
+        
+        auto result = mapsAPI->getDirections(origin, destination, mode);
+        if (result.success) {
+            std::cout << "Total Distance: " << std::fixed << std::setprecision(2) 
+                     << (result.totalDistance / 1000.0) << " km\n";
+            std::cout << "Total Duration: " << std::fixed << std::setprecision(0) 
+                     << (result.totalDuration / 60.0) << " minutes\n";
+            std::cout << "\nRoute Steps:\n";
+            for (size_t i = 0; i < result.waypoints.size(); ++i) {
+                std::cout << (i + 1) << ". " << result.waypoints[i] << "\n";
+            }
+        } else {
+            std::cout << "Could not get directions\n";
+        }
+    }
+    
+    void searchNearbyPlaces(const std::string& query, const std::string& location = "") {
+        if (!mapsAPI) {
+            std::cout << "Google Maps API not available\n";
+            return;
+        }
+        
+        std::cout << "\n=== PLACE SEARCH ===\n";
+        std::cout << "Query: " << query << "\n";
+        if (!location.empty()) {
+            std::cout << "Near: " << location << "\n";
+        }
+        std::cout << "\n";
+        
+        double lat = 0.0, lon = 0.0;
+        if (!location.empty()) {
+            auto geocode = mapsAPI->geocodeAddress(location);
+            if (geocode.success) {
+                lat = geocode.latitude;
+                lon = geocode.longitude;
+            }
+        }
+        
+        auto places = mapsAPI->searchPlaces(query, lat, lon);
+        if (!places.empty()) {
+            std::cout << "Found " << places.size() << " places:\n\n";
+            for (size_t i = 0; i < places.size(); ++i) {
+                const auto& place = places[i];
+                std::cout << (i + 1) << ". " << place.name << "\n";
+                std::cout << "   Address: " << place.address << "\n";
+                std::cout << "   Coordinates: " << place.latitude << ", " << place.longitude << "\n";
+                if (place.rating > 0) {
+                    std::cout << "   Rating: " << std::fixed << std::setprecision(1) << place.rating << "/5\n";
+                }
+                std::cout << "\n";
+            }
+        } else {
+            std::cout << "No places found\n";
+        }
+    }
+    
+    void getDistanceMatrix(const std::vector<std::string>& origins, const std::vector<std::string>& destinations) {
+        if (!mapsAPI) {
+            std::cout << "Google Maps API not available\n";
+            return;
+        }
+        
+        std::cout << "\n=== DISTANCE MATRIX ===\n";
+        std::cout << "Origins: ";
+        for (const auto& origin : origins) std::cout << origin << " ";
+        std::cout << "\nDestinations: ";
+        for (const auto& dest : destinations) std::cout << dest << " ";
+        std::cout << "\n\n";
+        
+        auto result = mapsAPI->getDistanceMatrix(origins, destinations);
+        if (result.success) {
+            std::cout << "Distance Matrix (km):\n";
+            for (size_t i = 0; i < origins.size(); ++i) {
+                std::cout << origins[i] << " -> ";
+                for (size_t j = 0; j < destinations.size(); ++j) {
+                    std::cout << std::fixed << std::setprecision(1) 
+                             << (result.distances[i][j] / 1000.0) << " ";
+                }
+                std::cout << "\n";
+            }
+            
+            std::cout << "\nDuration Matrix (minutes):\n";
+            for (size_t i = 0; i < origins.size(); ++i) {
+                std::cout << origins[i] << " -> ";
+                for (size_t j = 0; j < destinations.size(); ++j) {
+                    std::cout << std::fixed << std::setprecision(0) 
+                             << (result.durations[i][j] / 60.0) << " ";
+                }
+                std::cout << "\n";
+            }
+        } else {
+            std::cout << "Could not get distance matrix\n";
+        }
+    }
+    
+    bool hasGoogleMapsAPI() const {
+        return mapsAPI != nullptr;
+    }
+    
+    void runDemo() {
+        std::cout << "=== PRODUCTION-READY ROUTE OPTIMIZER ===\n";
+        std::cout << "Features: Dijkstra's Algorithm, A* Algorithm, Multi-destination TSP, Google Maps API\n";
+        
+        printAvailableLocations();
+        
+        // Demo 1: Single route with Dijkstra
+        std::cout << "\n--- Demo 1: Single Route (Dijkstra) ---";
+        findRoute("A", "G", "dijkstra");
+        
+        // Demo 2: Single route with A*
+        std::cout << "\n--- Demo 2: Single Route (A*) ---";
+        findRoute("A", "G", "astar");
+        
+        // Demo 3: Multi-destination optimization
+        std::cout << "\n--- Demo 3: Multi-destination TSP ---";
+        optimizeMultiDestination("A", {"B", "C", "D", "E"});
+        
+        // Demo 4: Google Maps API features (if available)
+        if (mapsAPI) {
+            std::cout << "\n--- Demo 4: Google Maps API Integration ---";
+            
+            // Geocoding demo
+            geocodeAddress("Times Square, New York, NY");
+            
+            // Real-time directions demo
+            getRealTimeDirections("Times Square, New York, NY", "Central Park, New York, NY");
+            
+            // Place search demo
+            searchNearbyPlaces("restaurant", "Manhattan, New York");
+            
+            // Distance matrix demo
+            getDistanceMatrix({"Times Square, New York", "Central Park, New York"}, 
+                            {"Brooklyn Bridge, New York", "Statue of Liberty, New York"});
+        }
+        
+        // Performance comparison
+        std::cout << "\n--- Performance Comparison ---";
+        std::cout << "\nTesting route from A to H with both algorithms:\n";
+        findRoute("A", "H", "dijkstra");
+        findRoute("A", "H", "astar");
+        
+        graph.printGraph();
+    }
+};
+
+// Main function
+int main() {
+    try {
+        RouteOptimizer optimizer;
+        optimizer.runDemo();
+        
+        // Interactive mode
+        std::cout << "\n=== INTERACTIVE MODE ===\n";
+        std::cout << "Enter 'help' for commands, 'quit' to exit\n";
+        
+        std::string input;
+        while (std::getline(std::cin, input)) {
+            if (input == "quit" || input == "exit") {
+                break;
+            } else if (input == "help") {
+                std::cout << "Commands:\n";
+                std::cout << "  locations - Show all available locations\n";
+                std::cout << "  route <start> <end> [algorithm] - Find route (algorithms: dijkstra, astar)\n";
+                std::cout << "  multi <start> <dest1> <dest2> ... - Optimize multi-destination route\n";
+                if (optimizer.hasGoogleMapsAPI()) {
+                    std::cout << "  geocode <address> - Convert address to coordinates\n";
+                    std::cout << "  directions <origin> <destination> [mode] - Get real-time directions\n";
+                    std::cout << "  search <query> [location] - Search for places\n";
+                    std::cout << "  matrix <origin1> <origin2> ... | <dest1> <dest2> ... - Get distance matrix\n";
+                }
+                std::cout << "  quit - Exit program\n";
+            } else if (input == "locations") {
+                optimizer.printAvailableLocations();
+            } else if (input.substr(0, 5) == "route") {
+                std::istringstream iss(input);
+                std::string cmd, start, end, algorithm = "dijkstra";
+                iss >> cmd >> start >> end >> algorithm;
+                if (!start.empty() && !end.empty()) {
+                    optimizer.findRoute(start, end, algorithm);
+                } else {
+                    std::cout << "Usage: route <start> <end> [algorithm]\n";
+                }
+            } else if (input.substr(0, 5) == "multi") {
+                std::istringstream iss(input);
+                std::string cmd, start, dest;
+                std::vector<std::string> destinations;
+                iss >> cmd >> start;
+                while (iss >> dest) {
+                    destinations.push_back(dest);
+                }
+                if (!start.empty() && !destinations.empty()) {
+                    optimizer.optimizeMultiDestination(start, destinations);
+                } else {
+                    std::cout << "Usage: multi <start> <dest1> <dest2> ...\n";
+                }
+            } else if (input.substr(0, 7) == "geocode") {
+                std::istringstream iss(input);
+                std::string cmd, address;
+                iss >> cmd;
+                std::getline(iss, address);
+                if (!address.empty()) {
+                    optimizer.geocodeAddress(address.substr(1)); // Remove leading space
+                } else {
+                    std::cout << "Usage: geocode <address>\n";
+                }
+            } else if (input.substr(0, 10) == "directions") {
+                std::istringstream iss(input);
+                std::string cmd, origin, destination, mode = "driving";
+                iss >> cmd >> origin >> destination >> mode;
+                if (!origin.empty() && !destination.empty()) {
+                    optimizer.getRealTimeDirections(origin, destination, mode);
+                } else {
+                    std::cout << "Usage: directions <origin> <destination> [mode]\n";
+                }
+            } else if (input.substr(0, 6) == "search") {
+                std::istringstream iss(input);
+                std::string cmd, query, location;
+                iss >> cmd >> query;
+                std::getline(iss, location);
+                if (!query.empty()) {
+                    optimizer.searchNearbyPlaces(query, location.empty() ? "" : location.substr(1));
+                } else {
+                    std::cout << "Usage: search <query> [location]\n";
+                }
+            } else if (input.substr(0, 6) == "matrix") {
+                std::istringstream iss(input);
+                std::string cmd, token;
+                std::vector<std::string> origins, destinations;
+                bool readingDestinations = false;
+                iss >> cmd;
+                
+                while (iss >> token) {
+                    if (token == "|") {
+                        readingDestinations = true;
+                    } else if (readingDestinations) {
+                        destinations.push_back(token);
+                    } else {
+                        origins.push_back(token);
+                    }
+                }
+                
+                if (!origins.empty() && !destinations.empty()) {
+                    optimizer.getDistanceMatrix(origins, destinations);
+                } else {
+                    std::cout << "Usage: matrix <origin1> <origin2> ... | <dest1> <dest2> ...\n";
+                }
+            } else {
+                std::cout << "Unknown command. Type 'help' for available commands.\n";
+            }
+            
+            std::cout << "\n> ";
+        }
+        
+        std::cout << "Thank you for using Route Optimizer!\n";
+        
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        return 1;
+    }
+    
+    return 0;
+}
